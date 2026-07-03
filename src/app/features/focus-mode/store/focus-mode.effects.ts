@@ -22,6 +22,8 @@ import { GlobalConfigService } from '../../config/global-config.service';
 import { TaskService } from '../../tasks/task.service';
 import { playSound } from '../../../util/play-sound';
 import { startWhiteNoise, stopWhiteNoise } from '../../../util/white-noise';
+import { startBreakEndAlarm, stopBreakEndAlarm } from '../../../util/break-end-alarm';
+import { FocusModeLocalSettingsService } from '../../config/focus-mode-local-settings.service';
 import { IS_ELECTRON } from '../../../app.constants';
 import { setCurrentTask, unsetCurrentTask } from '../../tasks/store/task.actions';
 import { selectLastCurrentTask, selectTaskById } from '../../tasks/store/task.selectors';
@@ -33,7 +35,12 @@ import {
   selectPomodoroConfig,
 } from '../../config/store/global-config.reducer';
 import { updateGlobalConfigSection } from '../../config/store/global-config.actions';
-import { FocusModeMode, FocusScreen, getBreakCycle } from '../focus-mode.model';
+import {
+  FocusModeMode,
+  FocusScreen,
+  getBreakCycle,
+  TimerState,
+} from '../focus-mode.model';
 import { MetricService } from '../../metric/metric.service';
 import { FocusModeStorageService } from '../focus-mode-storage.service';
 import { TakeABreakService } from '../../take-a-break/take-a-break.service';
@@ -62,6 +69,7 @@ export class FocusModeEffects {
   private notifyService = inject(NotifyService);
   private bannerService = inject(BannerService);
   private isAndroidWebView = inject(IS_ANDROID_WEB_VIEW_TOKEN);
+  private focusModeLocalSettingsService = inject(FocusModeLocalSettingsService);
 
   // Sync: When tracking starts → resume/skip-break or auto-spawn a new session.
   //
@@ -71,8 +79,8 @@ export class FocusModeEffects {
   // Auto-spawn (opt-in via `autoStartFocusOnPlay`): if no session is active and
   // the user has opted in, start a new session quietly. The overlay is NOT
   // dispatched — surface comes from the existing banner / future indicator.
-  // Inside the overlay we still respect `isSkipPreparation` so #7384's
-  // rocket-prep flow keeps working for users who entered via F-key.
+  // Inside the overlay we still respect `isShowPreparation` so #7384's
+  // rocket-prep flow keeps working for users who opted into the prep screen.
   syncTrackingStartToSession$ = createEffect(() =>
     this.taskService.currentTaskId$.pipe(
       skipWhileApplyingRemoteOps(),
@@ -125,10 +133,11 @@ export class FocusModeEffects {
             if (!cfg?.autoStartFocusOnPlay) {
               return EMPTY;
             }
-            // Bug #7384: respect isSkipPreparation only inside the overlay
-            // (preparation screen is overlay-bound). For the quiet auto-spawn
-            // path there's no overlay → no rocket → bypass the prep gate.
-            if (isOverlayShown && !cfg?.isSkipPreparation) {
+            // Bug #7384: respect isShowPreparation only inside the overlay
+            // (preparation screen is overlay-bound). When the user opted into the
+            // prep screen, let the manual Start click drive it; the quiet
+            // auto-spawn path (no overlay) has no rocket and bypasses the gate.
+            if (isOverlayShown && cfg?.isShowPreparation) {
               return EMPTY;
             }
             const strategy = this.strategyFactory.getStrategy(mode);
@@ -291,19 +300,42 @@ export class FocusModeEffects {
     () =>
       this.store.select(selectors.selectTimer).pipe(
         skipWhileApplyingRemoteOps(),
-        filter(
-          (timer) =>
-            timer.purpose === 'break' &&
-            !timer.isRunning &&
-            timer.startedAt !== null &&
-            timer.elapsed >= timer.duration,
-        ),
+        filter((timer) => this._isBreakTimeUp(timer)),
         distinctUntilChanged(
           (prev, curr) =>
             prev.elapsed === curr.elapsed && prev.startedAt === curr.startedAt,
         ),
         tap(() => {
-          this._notifyUser();
+          // When the looping break-end alarm is enabled it owns the break-end
+          // sound (breakEndAlarmSound$); skip the one-shot here so they don't
+          // double up. The window focus/flash still fires.
+          this._notifyUser(false, this._isLoopBreakEndAlarmOn());
+        }),
+      ),
+    { dispatch: false },
+  );
+
+  // Loop the break-end sound until the break is dismissed, when the user has
+  // opted in (per-device setting — see FocusModeLocalSettingsService / #8593).
+  // Mirrors whiteNoiseSound$: a single selector-based effect owns the loop
+  // lifecycle, so any leave-break transition (completeBreak / skipBreak /
+  // starting the next session — all of which flip timer.purpose away from
+  // 'break' or set it running again) naturally stops the loop via
+  // distinctUntilChanged. A hard safety ceiling inside startBreakEndAlarm()
+  // stops it regardless if the user truly walked away.
+  breakEndAlarmSound$ = createEffect(
+    () =>
+      this.store.select(selectors.selectTimer).pipe(
+        skipWhileApplyingRemoteOps(),
+        map((timer) => this._isBreakTimeUp(timer) && this._isLoopBreakEndAlarmOn()),
+        distinctUntilChanged(),
+        tap((shouldAlarm) => {
+          if (shouldAlarm) {
+            const soundVolume = this.globalConfigService.sound()?.volume || 0;
+            startBreakEndAlarm(SESSION_DONE_SOUND, soundVolume);
+          } else {
+            stopBreakEndAlarm();
+          }
         }),
       ),
     { dispatch: false },
@@ -919,11 +951,27 @@ export class FocusModeEffects {
     { dispatch: false },
   );
 
-  private _notifyUser(isHideBar = false): void {
+  private _isBreakTimeUp(timer: TimerState): boolean {
+    return (
+      timer.purpose === 'break' &&
+      !timer.isRunning &&
+      timer.startedAt !== null &&
+      timer.elapsed >= timer.duration
+    );
+  }
+
+  private _isLoopBreakEndAlarmOn(): boolean {
+    return (
+      this.focusModeLocalSettingsService.settings().isLoopBreakEndAlarm &&
+      (this.globalConfigService.sound()?.volume || 0) > 0
+    );
+  }
+
+  private _notifyUser(isHideBar = false, isSkipSound = false): void {
     const soundVolume = this.globalConfigService.sound()?.volume || 0;
 
-    // Play sound if enabled
-    if (soundVolume > 0) {
+    // Play sound if enabled (skipped when the looping break-end alarm owns it)
+    if (!isSkipSound && soundVolume > 0) {
       playSound(SESSION_DONE_SOUND, soundVolume);
     }
 

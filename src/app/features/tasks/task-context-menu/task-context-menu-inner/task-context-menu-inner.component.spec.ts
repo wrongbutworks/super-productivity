@@ -1,5 +1,5 @@
 import { TaskContextMenuInnerComponent } from './task-context-menu-inner.component';
-import { ComponentFixture, TestBed, fakeAsync, tick } from '@angular/core/testing';
+import { ComponentFixture, TestBed, fakeAsync, flush, tick } from '@angular/core/testing';
 import { signal } from '@angular/core';
 import { TaskService } from '../../task.service';
 import { provideMockStore, MockStore } from '@ngrx/store/testing';
@@ -15,9 +15,11 @@ import { WorkContextService } from '../../../work-context/work-context.service';
 import { TaskFocusService } from '../../task-focus.service';
 import { LocaleDatePipe } from 'src/app/ui/pipes/locale-date.pipe';
 import { DateAdapter } from '@angular/material/core';
-import { of } from 'rxjs';
+import { of, throwError } from 'rxjs';
 import { selectTaskByIdWithSubTaskData } from '../../store/task.selectors';
 import { addSubTask } from '../../store/task.actions';
+import { TaskSharedActions } from '../../../../root-store/meta/task-shared.actions';
+import { DateService } from '../../../../core/date/date.service';
 import { NoopAnimationsModule } from '@angular/platform-browser/animations';
 import { AddSubtaskInputService } from '../../add-subtask-input/add-subtask-input.service';
 import { Project } from '../../../project/project.model';
@@ -53,6 +55,9 @@ describe('TaskContextMenuInnerComponent', () => {
       'add',
       'createNewTaskWithDefaults',
       'currentTaskId',
+      'moveToProject',
+      'getTasksWithSubTasksByRepeatCfgId$',
+      'getArchiveTasksForRepeatCfgId',
     ]);
     taskService.currentTaskId.and.returnValue('some-id');
     addSubtaskInputService = jasmine.createSpyObj<AddSubtaskInputService>(
@@ -72,7 +77,10 @@ describe('TaskContextMenuInnerComponent', () => {
         { provide: AddSubtaskInputService, useValue: addSubtaskInputService },
         {
           provide: TaskRepeatCfgService,
-          useValue: { getTaskRepeatCfgById$: () => of(null) },
+          useValue: {
+            getTaskRepeatCfgById$: () => of(null),
+            getTaskRepeatCfgByIdAllowUndefined$: () => of(undefined),
+          },
         },
         { provide: MatDialog, useValue: { open: () => ({ afterClosed: () => of() }) } },
         {
@@ -89,6 +97,8 @@ describe('TaskContextMenuInnerComponent', () => {
                 projectInTreeOrder('project-a', 'Project A'),
               ]),
             getByIdOnce$: () => of({}),
+            moveTaskToTodayList: () => {},
+            moveTaskToBacklog: () => {},
           },
         },
         {
@@ -110,7 +120,10 @@ describe('TaskContextMenuInnerComponent', () => {
         { provide: WorkContextService, useValue: { activeWorkContext$: of({}) } },
         {
           provide: TaskFocusService,
-          useValue: { focusedTaskId: { set: () => {} } },
+          useValue: {
+            focusedTaskId: { set: () => {} },
+            isTaskContextMenuOpen: { set: () => {} },
+          },
         },
         { provide: LocaleDatePipe, useValue: {} },
         { provide: DateAdapter, useValue: { getFirstDayOfWeek: () => 0 } },
@@ -338,5 +351,91 @@ describe('TaskContextMenuInnerComponent', () => {
 
       expect(addSubtaskInputService.requestOpen).toHaveBeenCalledWith('PARENT_ID');
     });
+  });
+
+  // Moving a task between the backlog and the regular list is a list-position
+  // change only; it must not touch the task's schedule (issue #8592).
+  describe('moveToToday() / moveToBacklog() schedule preservation (#8592)', () => {
+    let projectService: ProjectService;
+
+    beforeEach(() => {
+      projectService = TestBed.inject(ProjectService);
+    });
+
+    it('moveToToday() moves to the regular list without scheduling for today', () => {
+      const moveSpy = spyOn(projectService, 'moveTaskToTodayList');
+      const dispatchSpy = spyOn(store, 'dispatch');
+      component.task = {
+        ...DEFAULT_TASK,
+        id: 'task-1',
+        projectId: 'project-current',
+      } as Task;
+
+      component.moveToToday();
+
+      expect(moveSpy).toHaveBeenCalledWith('task-1', 'project-current');
+      const dispatchedTypes = dispatchSpy.calls
+        .allArgs()
+        .map((args) => (args[0] as unknown as { type: string }).type);
+      expect(dispatchedTypes).not.toContain(TaskSharedActions.planTasksForToday.type);
+    });
+
+    it('moveToBacklog() moves to the backlog without clearing a schedule set for today', () => {
+      const moveSpy = spyOn(projectService, 'moveTaskToBacklog');
+      const dispatchSpy = spyOn(store, 'dispatch');
+      component.task = {
+        ...DEFAULT_TASK,
+        id: 'task-1',
+        projectId: 'project-current',
+        dueDay: TestBed.inject(DateService).todayStr(),
+      } as Task;
+
+      component.moveToBacklog();
+
+      expect(moveSpy).toHaveBeenCalledWith('task-1', 'project-current');
+      const dispatchedTypes = dispatchSpy.calls
+        .allArgs()
+        .map((args) => (args[0] as unknown as { type: string }).type);
+      expect(dispatchedTypes).not.toContain(TaskSharedActions.unscheduleTask.type);
+    });
+  });
+
+  // #8715: a task can reference a repeat config that was already deleted (e.g.
+  // via cross-client sync). Moving it must not throw ('Missing taskRepeatCfg')
+  // and crash — it should fall back to a plain task move.
+  describe('moveTaskToProject() with a deleted repeat config (#8715)', () => {
+    it('falls back to a plain move instead of crashing on the missing config', fakeAsync(() => {
+      const taskWithRepeat = {
+        ...DEFAULT_TASK,
+        id: 'task-repeat',
+        title: 'Repeat Task',
+        projectId: 'project-current',
+        repeatCfgId: 'deleted-cfg',
+      } as Task;
+      component.task = taskWithRepeat;
+
+      const taskWithSubTasks = { ...taskWithRepeat, subTasks: [] } as any;
+      store.overrideSelector(selectTaskByIdWithSubTaskData, taskWithSubTasks);
+      // config resolves to undefined (deleted); the other repeat lookups still run
+      taskService.getTasksWithSubTasksByRepeatCfgId$.and.returnValue(
+        of([taskWithSubTasks]),
+      );
+      taskService.getArchiveTasksForRepeatCfgId.and.returnValue(Promise.resolve([]));
+      // guard against regressing to the throwing selector (the #8715 root cause)
+      const repeatCfgService = TestBed.inject(TaskRepeatCfgService);
+      (
+        repeatCfgService as unknown as { getTaskRepeatCfgById$: () => unknown }
+      ).getTaskRepeatCfgById$ = () =>
+        throwError(() => new Error('Missing taskRepeatCfg'));
+
+      component.moveTaskToProject('project-b');
+      tick(50); // _getTaskWithSubtasks delay(50)
+      flush(); // focusRelatedTaskOrNext setTimeout
+
+      expect(taskService.moveToProject).toHaveBeenCalledWith(
+        taskWithSubTasks,
+        'project-b',
+      );
+    }));
   });
 });

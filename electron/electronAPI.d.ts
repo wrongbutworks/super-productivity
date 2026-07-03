@@ -10,25 +10,12 @@ import { AppDataCompleteLegacy } from '../src/app/imex/sync/sync.model';
 import { Task } from '../src/app/features/tasks/task.model';
 import { LocalBackupMeta } from '../src/app/imex/local-backup/local-backup.model';
 import { AppDataComplete } from '../src/app/op-log/model/model-config';
-import {
-  PluginNodeScriptRequest,
-  PluginNodeScriptResult,
-} from '../packages/plugin-api/src/types';
+import { PluginNodeExecutionElectronApi } from './shared-with-frontend/plugin-node-execution.model';
 import {
   LocalRestApiRequestPayload,
   LocalRestApiResponsePayload,
 } from './shared-with-frontend/local-rest-api.model';
 import { ElectronDistChannel } from './shared-with-frontend/get-dist-channel';
-
-export interface PluginNodeExecutionElectronApi {
-  requestGrant(pluginId: string): Promise<{ token: string } | null>;
-  executeScript(
-    pluginId: string,
-    grantToken: string,
-    request: PluginNodeScriptRequest,
-  ): Promise<PluginNodeScriptResult>;
-  revokeGrant(pluginId: string, grantToken: string): Promise<void>;
-}
 
 export interface ElectronAPI {
   on(
@@ -263,12 +250,10 @@ export interface ElectronAPI {
 
   onSwitchTask(listener: (taskId: string) => void): void;
 
-  exec(command: string): void;
-
   consumePluginNodeExecutionApi(): PluginNodeExecutionElectronApi | null;
 
   // Plugin OAuth
-  pluginOAuthPrepare(): Promise<{ port: number }>;
+  pluginOAuthPrepare(port?: number): Promise<{ port: number }>;
   pluginOAuthStart(url: string): void;
   onPluginOAuthCb(
     listener: (data: { code?: string; error?: string; state?: string }) => void,

@@ -1084,6 +1084,7 @@ export class OperationLogStoreService implements RemoteOperationApplyStorePort<O
   async markFailed(opIds: string[], maxRetries?: number): Promise<void> {
     await this._ensureInit();
     const now = Date.now();
+    let terminallyRejected = false;
     await this._adapter.transaction([STORE_NAMES.OPS], 'readwrite', async (tx) => {
       for (const opId of opIds) {
         const entry = await tx.getFromIndex<StoredOperationLogEntry>(
@@ -1098,6 +1099,7 @@ export class OperationLogStoreService implements RemoteOperationApplyStorePort<O
           if (maxRetries !== undefined && newRetryCount >= maxRetries) {
             entry.rejectedAt = now;
             entry.applicationStatus = undefined;
+            terminallyRejected = true;
           } else {
             entry.applicationStatus = 'failed';
             entry.retryCount = newRetryCount;
@@ -1106,6 +1108,9 @@ export class OperationLogStoreService implements RemoteOperationApplyStorePort<O
         }
       }
     });
+    if (terminallyRejected) {
+      this._invalidateUnsyncedCache();
+    }
   }
 
   /**

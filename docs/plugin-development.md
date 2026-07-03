@@ -131,7 +131,10 @@ The `manifest.json` file is required for all plugins and defines the plugin's me
 
 ### 1. JavaScript Plugins (`plugin.js`)
 
-Pure JavaScript plugins that run in a sandboxed environment with full API access.
+Pure JavaScript plugins with full API access. **These run in the host app's own
+renderer** (via `new Function`), not in a sandbox — plugin code shares the page's
+context and can reach privileged host APIs, so only install plugins whose source you
+trust (see [Security Considerations](#security-considerations)).
 
 **Use when:**
 
@@ -528,6 +531,74 @@ const data = await PluginAPI.loadSyncedData();
 console.log(data); // '{ count: 42 }'
 ```
 
+### Secret Storage
+
+For credentials — IMAP/SMTP passwords, API tokens, app passwords — use
+`setSecret` / `getSecret` / `deleteSecret`. Secrets are stored **local-only**:
+they are never synced, exported, or included in backups, and each plugin can
+only read its own keys.
+
+```javascript
+// Store a credential (key must be a non-empty string)
+await PluginAPI.setSecret('imapPassword', 'app-password-123');
+
+// Read it back when you need to connect
+const pw = await PluginAPI.getSecret('imapPassword'); // string | null
+
+// Remove it (e.g. when the user disconnects)
+await PluginAPI.deleteSecret('imapPassword');
+```
+
+Rules of thumb:
+
+- **Never** put a credential in `persistDataSynced` or in issue-provider
+  config — those sync to the server and land in exports/backups. Keep only
+  non-secret connection details there (host, port, username, filters) and put
+  the password/token in secret storage.
+- Secrets are **per-device**: a value set on desktop is not available on mobile,
+  so prompt the user to enter the credential on each device. (This matches how
+  IMAP app-passwords are typically used anyway.)
+- Secrets are stored unencrypted at rest today (the same as plugin OAuth
+  tokens); the guarantee is "stays on this device, never synced," not
+  hardware-level encryption. Don't store anything you wouldn't accept living in
+  the app's local profile.
+- All secrets for a plugin are purged automatically when the plugin is
+  uninstalled.
+
+#### Secrets in issue-provider plugins
+
+Issue-provider plugins get the same secret API (an issue provider is a normal
+plugin that also calls `registerIssueProvider`). Your definition callbacks
+(`getHeaders`, `getById`, `searchIssues`, …) run in your plugin's context, so
+they can read secrets directly:
+
+```javascript
+PluginAPI.registerIssueProvider({
+  // Declare only NON-secret fields here — their values are stored in the
+  // synced issue-provider config:
+  configFields: [
+    { key: 'host', type: 'text', label: 'Host' },
+    { key: 'username', type: 'text', label: 'Username' },
+  ],
+  // getHeaders may return a Promise, so read the credential from secret
+  // storage instead of from `config`:
+  async getHeaders(config) {
+    const token = await PluginAPI.getSecret('apiToken');
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  },
+  async getById(issueId, config, http) {
+    /* ... http call uses the headers above ... */
+  },
+  // ...
+});
+```
+
+The host passes only the synced `config` into these callbacks — there is no
+secret parameter, and the declarative `configFields` form always writes to the
+synced config. So collect the secret through your own UI (a config dialog
+registered via `registerConfigHandler`, or a side panel) and store it with
+`setSecret` there; do **not** add the credential as a `configFields` entry.
+
 ## Best Practices
 
 ### 1. Performance
@@ -552,10 +623,33 @@ console.log(data); // '{ count: 42 }'
 Plugins with `"permissions": ["nodeExecution"]` can run Node.js scripts in the Electron
 desktop app after the user allows the desktop permission prompt.
 
-The desktop grant is currently issued only for packaged built-in plugins whose
-manifest can be verified by the main process. Uploaded plugins that request
-`nodeExecution` are rejected until uploaded plugin installation is moved to a
-main-process-owned verification path.
+Both built-in and uploaded (community) plugins may request `nodeExecution`. The grant is
+issued by the Electron **main** process after a native consent dialog and is bound to the
+plugin id. For uploaded plugins the app cannot verify the manifest, so the dialog flags
+the plugin as unverified third-party code with full machine access that Super Productivity
+cannot sandbox, and defaults to **Deny** — only allow plugins whose source you trust. If
+the user denies, the plugin stays enabled but its node calls fail until it is re-enabled.
+
+Consent handling differs by plugin type:
+
+- **Uploaded (community) plugins:** consent is remembered **once per plugin** in a
+  main-owned, local-only store (`Allow` is not asked again on the next launch). The
+  consent is **never synced** — granting on one device does not auto-grant on another;
+  the other device prompts afresh on first node use. Consent is automatically cleared
+  (forcing a fresh prompt) when you **disable**, **uninstall**, or **re-upload** the
+  plugin, so replacing a plugin's code under the same id always re-asks. To revoke access
+  without removing the plugin, simply disable it.
+- **Built-in plugins** (e.g. `sync-md`) keep the per-session prompt and are not persisted.
+
+> **Plugin id constraints (for `nodeExecution`):** the consent grant keys on your
+> manifest `id`, so it must be a single safe token — no whitespace, control/bidi
+> characters, `:`, path separators (`/`, `\`), and at most 100 characters. Lowercase
+> kebab-case is recommended; dots and uppercase are accepted.
+
+> **Security note:** a granted `nodeExecution` plugin can run any program with full
+> access to your files and system. The file/IPC channel a plugin uses to talk to a
+> companion process is an open local channel — treat any data it reads as untrusted
+> input (never `eval`/`require` its contents).
 
 ```javascript
 const result = await plugin.executeNodeScript({
@@ -661,11 +755,26 @@ persistence in iframes; persist when the data changes instead.
 
 ## Security Considerations
 
-### Sandboxing
+### Execution model & trust
 
-- JavaScript plugins run in isolated VM contexts
-- Iframe plugins run in sandboxed iframes with restricted permissions
-- No access to file system unless through API
+Plugins are **not** strongly sandboxed from the host — installing a plugin means
+trusting its code with your data:
+
+- JavaScript (`plugin.js`) plugins run in the host app's renderer via `new Function`,
+  in the same context as the app. They can reach privileged host APIs (including, on
+  desktop, `window.ea`).
+- Iframe plugins render with the `allow-same-origin` sandbox flag (required so the UI
+  paints on the packaged `file://` desktop build). Being same-origin, they can read
+  `window.parent.ea` directly, so the `postMessage` bridge is a convenience, not a hard
+  security boundary.
+- Filesystem/process access on desktop goes through `executeNodeScript()`, which stays
+  gated by an explicit main-process consent prompt (`nodeExecution` permission). This is
+  the only sanctioned way for a plugin to run native code.
+- There is no `window.ea.exec()`: the old IPC that ran arbitrary shell commands via
+  `child_process.exec` (reachable by any plugin/iframe/XSS, bypassing the `nodeExecution`
+  consent) was removed. Legacy `COMMAND` task attachments no longer execute.
+
+Only install plugins from sources you trust, and read the code first.
 
 ### Iframe API Surface
 
@@ -683,9 +792,13 @@ the desktop app grants the plugin `nodeExecution` permission.
 
 ### Iframe Boundary
 
-- Iframe plugins run without `allow-same-origin`, so they have an opaque origin
-- Host access is limited to the filtered Plugin API `postMessage` bridge
+- Iframe plugins render with `allow-same-origin` (required so the UI paints on the
+  packaged `file://` desktop build; an opaque-origin iframe stays blank — see #8467)
+- Because they are same-origin, iframe plugins can read `window.parent.ea` directly;
+  the filtered `postMessage` bridge is the intended API, not an enforced boundary
 - Remote assets depend on the app/runtime CSP and should not be relied on
+- Restoring opaque-origin isolation (serving the renderer from an `app://` scheme) is
+  tracked separately
 
 ## Testing Your Plugin
 

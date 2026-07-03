@@ -228,8 +228,6 @@ const ea: ElectronAPI = {
       focusModeMode,
     ),
 
-  exec: (command: string) => _send('EXEC', command),
-
   updateTodayTasks: (tasks: any[]) => _send('TODAY_TASKS_UPDATED', tasks),
 
   onSwitchTask: (listener: (taskId: string) => void) => {
@@ -245,8 +243,11 @@ const ea: ElectronAPI = {
     }
     pluginNodeExecutionApiConsumed = true;
     return {
-      requestGrant: (pluginId: string) =>
-        _invoke('PLUGIN_REQUEST_NODE_EXECUTION_GRANT', pluginId) as Promise<{
+      requestGrant: (
+        pluginId: string,
+        displayInfo?: { name?: string; version?: string },
+      ) =>
+        _invoke('PLUGIN_REQUEST_NODE_EXECUTION_GRANT', pluginId, displayInfo) as Promise<{
           token: string;
         } | null>,
       executeScript: (
@@ -266,11 +267,14 @@ const ea: ElectronAPI = {
           pluginId,
           grantToken,
         ) as Promise<void>,
+      clearConsent: (pluginId: string) =>
+        _invoke('PLUGIN_CLEAR_NODE_EXECUTION_CONSENT', pluginId) as Promise<void>,
     };
   },
 
   // Plugin OAuth
-  pluginOAuthPrepare: () => _invoke('PLUGIN_OAUTH_PREPARE') as Promise<{ port: number }>,
+  pluginOAuthPrepare: (port?: number) =>
+    _invoke('PLUGIN_OAUTH_PREPARE', port) as Promise<{ port: number }>,
   pluginOAuthStart: (url: string) => _send('PLUGIN_OAUTH_START', { url }),
   onPluginOAuthCb: (
     listener: (data: { code?: string; error?: string; state?: string }) => void,

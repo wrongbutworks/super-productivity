@@ -49,6 +49,7 @@ describe('DialogSyncCfgComponent', () => {
     mockSyncWrapperService = jasmine.createSpyObj('SyncWrapperService', [
       'configuredAuthForSyncProviderIfNecessary',
       'sync',
+      'markPromptEncryptionAfterSetupSync',
     ]);
     mockSyncWrapperService.sync.and.resolveTo();
 
@@ -62,6 +63,10 @@ describe('DialogSyncCfgComponent', () => {
 
     mockSnackService = jasmine.createSpyObj('SnackService', ['open']);
     mockMatDialog = jasmine.createSpyObj('MatDialog', ['open']);
+    // Default: the file-based setup encryption dialog is dismissed/skipped.
+    mockMatDialog.open.and.returnValue({
+      afterClosed: () => of(undefined),
+    } as any);
 
     TestBed.configureTestingModule({
       imports: [
@@ -181,6 +186,196 @@ describe('DialogSyncCfgComponent', () => {
 
       expect(mockSyncConfigService.updateSettingsFromForm).toHaveBeenCalled();
       expect(mockDialogRef.close).toHaveBeenCalled();
+    });
+  });
+
+  describe('save() — SuperSync fresh-setup encryption prompt flag', () => {
+    // navigator.onLine is false in the sandbox; pin it explicitly so the
+    // online-gated sync branch runs deterministically regardless of environment.
+    const setOnline = (isOnline: boolean): void => {
+      spyOnProperty(navigator, 'onLine', 'get').and.returnValue(isOnline);
+    };
+    const forceOnline = (): void => setOnline(true);
+
+    const superSyncProvider = {
+      id: SyncProviderId.SuperSync,
+      isReady: jasmine.createSpy('isReady').and.resolveTo(true),
+    };
+
+    it('flags the setup sync when SuperSync is enabled from a disabled state (fresh setup)', async () => {
+      forceOnline();
+      mockProviderManager.getProviderById.and.resolveTo(superSyncProvider as any);
+
+      (component as any)._tmpUpdatedCfg = {
+        ...(component as any)._tmpUpdatedCfg,
+        syncProvider: SyncProviderId.SuperSync,
+        isEnabled: true,
+        _isInitialSetup: true,
+      };
+
+      await component.save();
+
+      expect(
+        mockSyncWrapperService.markPromptEncryptionAfterSetupSync,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    it('arms the flag even when offline (setup sync runs once back online)', async () => {
+      // Regression guard: the flag must be armed OUTSIDE the isOnline() gate, else
+      // an offline SuperSync setup silently syncs unencrypted with no prompt later.
+      setOnline(false);
+      mockProviderManager.getProviderById.and.resolveTo(superSyncProvider as any);
+
+      (component as any)._tmpUpdatedCfg = {
+        ...(component as any)._tmpUpdatedCfg,
+        syncProvider: SyncProviderId.SuperSync,
+        isEnabled: true,
+        _isInitialSetup: true,
+      };
+
+      await component.save();
+
+      expect(
+        mockSyncWrapperService.markPromptEncryptionAfterSetupSync,
+      ).toHaveBeenCalledTimes(1);
+      // Offline → no sync kicked off this session.
+      expect(mockSyncWrapperService.sync).not.toHaveBeenCalled();
+    });
+
+    it('does NOT flag when re-saving an already-established SuperSync config', async () => {
+      forceOnline();
+      mockProviderManager.getProviderById.and.resolveTo(superSyncProvider as any);
+
+      (component as any)._tmpUpdatedCfg = {
+        ...(component as any)._tmpUpdatedCfg,
+        syncProvider: SyncProviderId.SuperSync,
+        isEnabled: true,
+        _isInitialSetup: false,
+      };
+
+      await component.save();
+
+      expect(
+        mockSyncWrapperService.markPromptEncryptionAfterSetupSync,
+      ).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('save() — file-based pre-upload encryption (collect password)', () => {
+    const setOnline = (isOnline: boolean): void => {
+      spyOnProperty(navigator, 'onLine', 'get').and.returnValue(isOnline);
+    };
+
+    const mockDialogResult = (result: unknown): void => {
+      mockMatDialog.open.and.returnValue({ afterClosed: () => of(result) } as any);
+    };
+
+    beforeEach(() => {
+      mockProviderManager.getProviderById.and.resolveTo({
+        id: SyncProviderId.WebDAV,
+        isReady: jasmine.createSpy('isReady').and.resolveTo(true),
+      } as any);
+      mockSyncWrapperService.configuredAuthForSyncProviderIfNecessary.and.resolveTo({
+        wasConfigured: false,
+      } as any);
+    });
+
+    const setFreshWebdavCfg = (overrides: Partial<SyncConfig> = {}): void => {
+      (component as any)._tmpUpdatedCfg = {
+        ...(component as any)._tmpUpdatedCfg,
+        syncProvider: SyncProviderId.WebDAV,
+        isEnabled: true,
+        isEncryptionEnabled: false,
+        _isInitialSetup: true,
+        ...overrides,
+      };
+    };
+
+    const savedConfig = (): SyncConfig =>
+      mockSyncConfigService.updateSettingsFromForm.calls.mostRecent()
+        .args[0] as SyncConfig;
+
+    it('persists the entered key + isEncryptionEnabled in the SAME config save (first sync encrypts)', async () => {
+      setOnline(true);
+      mockDialogResult({ success: true, password: 'hunter2-secret' });
+      setFreshWebdavCfg();
+
+      await component.save();
+
+      expect(mockMatDialog.open).toHaveBeenCalledTimes(1);
+      const cfg = savedConfig();
+      expect(cfg.encryptKey).toBe('hunter2-secret');
+      expect(cfg.isEncryptionEnabled).toBeTrue();
+      // Normal setup sync still runs — encrypted via config, no separate upload.
+      expect(mockSyncWrapperService.sync).toHaveBeenCalledOnceWith(true);
+    });
+
+    it('saves without encryption when the user skips the prompt', async () => {
+      setOnline(true);
+      mockDialogResult({ success: false });
+      setFreshWebdavCfg();
+
+      await component.save();
+
+      expect(mockMatDialog.open).toHaveBeenCalledTimes(1);
+      const cfg = savedConfig();
+      expect(cfg.encryptKey).toBe('');
+      expect(cfg.isEncryptionEnabled).toBeFalse();
+      expect(mockSyncWrapperService.sync).toHaveBeenCalledOnceWith(true);
+    });
+
+    it('does NOT prompt when re-saving an already-configured provider (not a fresh setup)', async () => {
+      setOnline(true);
+      mockDialogResult({ success: true, password: 'unused' });
+      setFreshWebdavCfg({ _isInitialSetup: false } as any);
+
+      await component.save();
+
+      expect(mockMatDialog.open).not.toHaveBeenCalled();
+      expect(savedConfig().isEncryptionEnabled).toBeFalse();
+    });
+
+    it('does NOT prompt when encryption is already enabled', async () => {
+      setOnline(true);
+      mockDialogResult({ success: true, password: 'unused' });
+      setFreshWebdavCfg({ isEncryptionEnabled: true });
+
+      await component.save();
+
+      expect(mockMatDialog.open).not.toHaveBeenCalled();
+    });
+
+    it('does NOT prompt for a non-file-based provider (SuperSync)', async () => {
+      setOnline(true);
+      mockDialogResult({ success: true, password: 'unused' });
+      mockProviderManager.getProviderById.and.resolveTo({
+        id: SyncProviderId.SuperSync,
+        isReady: jasmine.createSpy('isReady').and.resolveTo(true),
+      } as any);
+      setFreshWebdavCfg({ syncProvider: SyncProviderId.SuperSync });
+
+      await component.save();
+
+      expect(mockMatDialog.open).not.toHaveBeenCalled();
+      // SuperSync keeps its separate post-setup prompt path.
+      expect(
+        mockSyncWrapperService.markPromptEncryptionAfterSetupSync,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    it('offers the prompt even offline (key is config, applied on the next sync)', async () => {
+      setOnline(false);
+      mockDialogResult({ success: true, password: 'offline-pw' });
+      setFreshWebdavCfg();
+
+      await component.save();
+
+      expect(mockMatDialog.open).toHaveBeenCalledTimes(1);
+      const cfg = savedConfig();
+      expect(cfg.encryptKey).toBe('offline-pw');
+      expect(cfg.isEncryptionEnabled).toBeTrue();
+      // Offline → no immediate sync, but encryption is already persisted.
+      expect(mockSyncWrapperService.sync).not.toHaveBeenCalled();
     });
   });
 

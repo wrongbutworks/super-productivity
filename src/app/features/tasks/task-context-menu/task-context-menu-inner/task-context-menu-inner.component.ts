@@ -588,7 +588,7 @@ export class TaskContextMenuInnerComponent implements AfterViewInit, OnDestroy {
 
       forkJoin([
         this._taskRepeatCfgService
-          .getTaskRepeatCfgById$(this.task.repeatCfgId)
+          .getTaskRepeatCfgByIdAllowUndefined$(this.task.repeatCfgId)
           .pipe(first()),
         this._taskService
           .getTasksWithSubTasksByRepeatCfgId$(this.task.repeatCfgId)
@@ -609,6 +609,15 @@ export class TaskContextMenuInnerComponent implements AfterViewInit, OnDestroy {
                 nonArchiveInstancesWithSubTasks,
                 archiveInstances,
               });
+
+              // Repeat config was deleted (e.g. via cross-client sync) but the task
+              // still references it — treat it as a plain task move instead of
+              // crashing on the missing config. (#8715)
+              if (!reminderCfg) {
+                this._taskService.moveToProject(taskWithSubTasks, projectId);
+                this.onClose();
+                return EMPTY;
+              }
 
               // if there is only a single instance (probably just created) than directly update the task repeat cfg
               if (
@@ -674,20 +683,17 @@ export class TaskContextMenuInnerComponent implements AfterViewInit, OnDestroy {
 
   moveToBacklog(): void {
     if (this.task.projectId && !this.task.parentId) {
+      // Moving to the backlog is a list-position change only; it must not
+      // alter the task's schedule (#8592).
       this._projectService.moveTaskToBacklog(this.task.id, this.task.projectId);
-      if (
-        this.task.dueDay === this._dateService.todayStr() ||
-        (this.task.dueWithTime && this._dateService.isToday(this.task.dueWithTime))
-      ) {
-        this.unschedule();
-      }
     }
   }
 
   moveToToday(): void {
     if (this.task.projectId && !this.task.parentId) {
+      // Moving to the regular list is a list-position change only; it must not
+      // schedule the task for today (#8592).
       this._projectService.moveTaskToTodayList(this.task.id, this.task.projectId);
-      this.addToMyDay();
     }
   }
 

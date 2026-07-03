@@ -84,6 +84,7 @@ import { IssueSyncAdapterRegistryService } from '../features/issue/two-way-sync/
 import { PluginHttpService } from './issue-provider/plugin-http.service';
 import { createPluginSyncAdapter } from './issue-provider/plugin-sync-adapter.service';
 import { PluginOAuthBridgeService } from './oauth/plugin-oauth-bridge.service';
+import { PluginSecretService } from './secret/plugin-secret.service';
 import { ISSUE_PROVIDER_TYPES } from '../features/issue/issue.const';
 import { PluginService } from './plugin.service';
 import { PluginI18nService } from './plugin-i18n.service';
@@ -117,16 +118,7 @@ import {
 } from '../features/simple-counter/store/simple-counter.actions';
 import { getDbDateStr } from '../util/get-db-date-str';
 import { DataInitService } from '../core/data-init/data-init.service';
-
-interface PluginNodeExecutionElectronApi {
-  requestGrant(pluginId: string): Promise<{ token: string } | null>;
-  executeScript(
-    pluginId: string,
-    grantToken: string,
-    request: PluginNodeScriptRequest,
-  ): Promise<PluginNodeScriptResult>;
-  revokeGrant(pluginId: string, grantToken: string): Promise<void>;
-}
+import { PluginNodeExecutionElectronApi } from '../../../electron/shared-with-frontend/plugin-node-execution.model';
 
 type PluginDateFormat = 'short' | 'medium' | 'long' | 'time' | 'datetime';
 
@@ -164,6 +156,7 @@ export class PluginBridgeService implements OnDestroy {
   private _syncAdapterRegistry = inject(IssueSyncAdapterRegistryService);
   private _pluginHttpService = inject(PluginHttpService);
   private _pluginOAuthBridge = inject(PluginOAuthBridgeService);
+  private _pluginSecretService = inject(PluginSecretService);
   private _dataInitService = inject(DataInitService);
   private _globalConfigService = inject(GlobalConfigService);
   readonly #nodeExecutionGrantTokens = new Map<string, string>();
@@ -279,6 +272,9 @@ export class PluginBridgeService implements OnDestroy {
     startOAuthFlow: (config: OAuthFlowConfig) => Promise<OAuthTokenResult>;
     getOAuthToken: () => Promise<string | null>;
     clearOAuthToken: () => Promise<void>;
+    setSecret: (key: string, value: string) => Promise<void>;
+    getSecret: (key: string) => Promise<string | null>;
+    deleteSecret: (key: string) => Promise<void>;
     translate: (key: string, params?: Record<string, string | number>) => string;
     formatDate: (date: Date | string | number, format: PluginDateFormat) => string;
     getCurrentLanguage: () => string;
@@ -372,6 +368,14 @@ export class PluginBridgeService implements OnDestroy {
         ),
       clearOAuthToken: (): Promise<void> =>
         this._pluginOAuthBridge.clearOAuthTokens(pluginId),
+
+      // Secret storage (local-only, per-plugin, never synced)
+      setSecret: (key: string, value: string): Promise<void> =>
+        this._pluginSecretService.setSecret(pluginId, key, value),
+      getSecret: (key: string): Promise<string | null> =>
+        this._pluginSecretService.getSecret(pluginId, key),
+      deleteSecret: (key: string): Promise<void> =>
+        this._pluginSecretService.deleteSecret(pluginId, key),
 
       // i18n
       translate: (key: string, params?: Record<string, string | number>): string =>
@@ -827,12 +831,12 @@ export class PluginBridgeService implements OnDestroy {
 
     let createdTask: Task;
     if (taskData.parentId) {
-      // For subtasks, we need to use the addSubTask action to properly update parent.
-      // Short-syntax (e.g. "15m") is normally applied by ShortSyntaxEffects, but that
-      // effect only listens to `addTask`/`updateTask` — not `addSubTask`. So the
-      // bridge has to parse subtask titles itself, mirroring MarkdownPasteService.
-      // Tags/projects are intentionally not parsed: subtasks always inherit them
-      // from the parent (see addSubTask reducer).
+      // For subtasks, we use the addSubTask action to properly update the parent.
+      // ShortSyntaxEffects now also parses addSubTask, but we opt this path out via
+      // `isIgnoreShortSyntax` and parse only time here (mirroring MarkdownPasteService):
+      // subtasks created via the plugin API intentionally inherit tags/project from
+      // the parent and must not have them reassigned from the title (see addSubTask
+      // reducer).
       const subTaskTitleProps = this._parseSubTaskTitleTimeProps(taskData.title);
       const newTask = this._taskService.createNewTaskWithDefaults({
         title: subTaskTitleProps.title,
@@ -851,6 +855,7 @@ export class PluginBridgeService implements OnDestroy {
         addSubTask({
           task: newTask,
           parentId: taskData.parentId,
+          isIgnoreShortSyntax: true,
         }),
       );
       createdTask = newTask;
@@ -1598,8 +1603,9 @@ export class PluginBridgeService implements OnDestroy {
    */
   // Mirrors MarkdownPasteService._parseTimeProps: respects the user's
   // shortSyntax.isEnableDue config, returns the cleaned title and any parsed
-  // time fields. Used for subtasks because `addSubTask` doesn't trigger the
-  // ShortSyntaxEffects pipeline.
+  // time fields. Used for subtasks created via the plugin API, which opt out of
+  // the ShortSyntaxEffects pipeline (isIgnoreShortSyntax) to parse time only and
+  // keep tags/project inherited from the parent.
   private _parseSubTaskTitleTimeProps(originalTitle: string): {
     title: string;
     timeProps: Partial<TaskCopy>;
@@ -1714,8 +1720,11 @@ export class PluginBridgeService implements OnDestroy {
     return this.#nodeExecutionGrantTokens.get(pluginId);
   }
 
-  async requestNodeExecutionGrant(pluginId: string): Promise<{ token: string } | null> {
-    return (await this.#nodeExecutionApi?.requestGrant(pluginId)) ?? null;
+  async requestNodeExecutionGrant(
+    pluginId: string,
+    displayInfo?: { name?: string; version?: string },
+  ): Promise<{ token: string } | null> {
+    return (await this.#nodeExecutionApi?.requestGrant(pluginId, displayInfo)) ?? null;
   }
 
   revokeNodeExecutionGrantToken(pluginId: string): string | undefined {
@@ -1726,6 +1735,16 @@ export class PluginBridgeService implements OnDestroy {
 
   async revokeNodeExecutionGrant(pluginId: string, grantToken: string): Promise<void> {
     await this.#nodeExecutionApi?.revokeGrant(pluginId, grantToken);
+  }
+
+  /**
+   * Drop both the in-renderer session token and the main-owned persisted consent for a
+   * plugin (issue #8512 Phase 2). Used on disable / uninstall / re-upload so the next
+   * node call re-prompts. No-op on web (no node execution API).
+   */
+  async clearNodeExecutionConsent(pluginId: string): Promise<void> {
+    this.#nodeExecutionGrantTokens.delete(pluginId);
+    await this.#nodeExecutionApi?.clearConsent(pluginId);
   }
 
   /**

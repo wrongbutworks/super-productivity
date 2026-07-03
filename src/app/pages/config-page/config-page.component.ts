@@ -10,7 +10,11 @@ import {
 import { ActivatedRoute } from '@angular/router';
 import { GlobalConfigService } from '../../features/config/global-config.service';
 import { TaskWidgetSettingsService } from '../../features/config/task-widget-settings.service';
-import { TaskWidgetConfig } from '../../features/config/global-config.model';
+import { FocusModeLocalSettingsService } from '../../features/config/focus-mode-local-settings.service';
+import {
+  FocusModeLocalConfig,
+  TaskWidgetConfig,
+} from '../../features/config/global-config.model';
 import {
   GLOBAL_GENERAL_FORM_CONFIG,
   GLOBAL_IMEX_FORM_CONFIG,
@@ -36,6 +40,8 @@ import { IS_ELECTRON } from '../../app.constants';
 import { IS_ANDROID_WEB_VIEW_TOKEN } from '../../util/is-android-web-view';
 import { getAutomaticBackUpFormCfg } from '../../features/config/form-cfgs/automatic-backups-form.const';
 import { getAppVersionStr } from '../../util/get-app-version-str';
+import { UpdateCheckService } from '../../core/update-check/update-check.service';
+import { isUpdateCheckPossible } from '../../core/update-check/is-update-check-possible.util';
 import { ConfigSectionComponent } from '../../features/config/config-section/config-section.component';
 import { ConfigSoundFormComponent } from '../../features/config/config-sound-form/config-sound-form.component';
 import { TranslatePipe, TranslateService } from '@ngx-translate/core';
@@ -95,10 +101,12 @@ export class ConfigPageComponent implements OnInit {
   private readonly _localBackupService = inject(LocalBackupService);
   private readonly _translateService = inject(TranslateService);
   private readonly _isAndroidWebView = inject(IS_ANDROID_WEB_VIEW_TOKEN);
+  private readonly _updateCheckService = inject(UpdateCheckService);
 
   readonly configService = inject(GlobalConfigService);
   readonly syncSettingsService = inject(SyncConfigService);
   readonly taskWidgetSettingsService = inject(TaskWidgetSettingsService);
+  readonly focusModeLocalSettingsService = inject(FocusModeLocalSettingsService);
 
   T: typeof T = T;
 
@@ -152,6 +160,7 @@ export class ConfigPageComponent implements OnInit {
 
   appVersion: string = getAppVersionStr();
   versions?: typeof versions = versions;
+  isUpdateCheckPossible: boolean = isUpdateCheckPossible();
 
   private readonly _destroyRef = inject(DestroyRef);
 
@@ -326,6 +335,12 @@ export class ConfigPageComponent implements OnInit {
       return;
     }
 
+    // focusModeLocal is per-instance (not synced) — handled by a dedicated service
+    if (formSectionKey === 'focusModeLocal') {
+      this.focusModeLocalSettingsService.update(config as Partial<FocusModeLocalConfig>);
+      return;
+    }
+
     // From here on we know it's a real GlobalConfigState section.
     const sectionKey = formSectionKey as GlobalConfigSectionKey;
 
@@ -410,6 +425,9 @@ export class ConfigPageComponent implements OnInit {
     if (sectionKey === 'taskWidget') {
       return this.taskWidgetSettingsService.settings() as GlobalSectionConfig;
     }
+    if (sectionKey === 'focusModeLocal') {
+      return this.focusModeLocalSettingsService.settings() as GlobalSectionConfig;
+    }
     return (this.globalCfg as unknown as Record<string, GlobalSectionConfig>)[sectionKey];
   }
 
@@ -419,6 +437,10 @@ export class ConfigPageComponent implements OnInit {
       maxWidth: '95vw',
       data: { logs: Log.exportLogHistory() },
     });
+  }
+
+  checkForUpdates(): void {
+    this._updateCheckService.checkForUpdate({ isUserTriggered: true });
   }
 
   async copyVersionToClipboard(text: string): Promise<void> {

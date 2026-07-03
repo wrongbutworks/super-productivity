@@ -130,7 +130,7 @@ import { AddSubtaskInputService } from '../add-subtask-input/add-subtask-input.s
     '[class.isSelected]': 'isSelected()',
     '[class.hasNoSubTasks]': 'task().subTaskIds.length === 0',
     '[class.isDragReady]': 'isDragReady()',
-    '[class.hasTimeConflict]': 'hasTimeConflict()',
+    '[class.isOverdue]': 'isOverdue()',
     '(contextmenu)': 'onHostContextMenu($event)',
   },
   imports: [
@@ -230,9 +230,6 @@ export class TaskComponent implements OnDestroy, AfterViewInit {
     return 'chat';
   });
 
-  isTaskOnTodayList = computed(() =>
-    this._taskService.todayListSet().has(this.task().id),
-  );
   isTodayListActive = computed(() => this.workContextService.isTodayList);
   taskIdWithPrefix = computed(() => 't-' + this.task().id);
   isRepeatTaskCreatedToday = computed(
@@ -1250,7 +1247,9 @@ export class TaskComponent implements OnDestroy, AfterViewInit {
       setTimeout(() => this.focusNext(true));
     } else {
       forkJoin([
-        this._taskRepeatCfgService.getTaskRepeatCfgById$(t.repeatCfgId).pipe(first()),
+        this._taskRepeatCfgService
+          .getTaskRepeatCfgByIdAllowUndefined$(t.repeatCfgId)
+          .pipe(first()),
         this._taskService.getTasksWithSubTasksByRepeatCfgId$(t.repeatCfgId).pipe(first()),
         this._taskService.getArchiveTasksForRepeatCfgId(t.repeatCfgId),
         this._projectService.getByIdOnce$(projectId),
@@ -1268,6 +1267,15 @@ export class TaskComponent implements OnDestroy, AfterViewInit {
                 nonArchiveInstancesWithSubTasks,
                 archiveInstances,
               });
+
+              // Repeat config was deleted (e.g. via cross-client sync) but the task
+              // still references it — treat it as a plain task move instead of
+              // crashing on the missing config. (#8715)
+              if (!reminderCfg) {
+                this._taskService.moveToProject(this.task(), projectId);
+                setTimeout(() => this.focusNext(true));
+                return EMPTY;
+              }
 
               // if there is only a single instance (probably just created) than directly update the task repeat cfg
               if (
@@ -1335,18 +1343,18 @@ export class TaskComponent implements OnDestroy, AfterViewInit {
   moveToBacklog(): void {
     const t = this.task();
     if (t.projectId && !t.parentId) {
+      // Moving to the backlog is a list-position change only; it must not
+      // alter the task's schedule (#8592).
       this._projectService.moveTaskToBacklog(t.id, t.projectId);
-      if (this.isTaskOnTodayList()) {
-        this.unschedule();
-      }
     }
   }
 
   moveToToday(): void {
     const t = this.task();
     if (t.projectId) {
+      // Moving to the regular list is a list-position change only; it must not
+      // schedule the task for today (#8592).
       this._projectService.moveTaskToTodayList(t.id, t.projectId);
-      this.addToMyDay();
     }
   }
 

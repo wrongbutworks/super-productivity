@@ -46,6 +46,34 @@ export class PlainspaceApiService {
     );
   }
 
+  /**
+   * The human-facing web URL of the bound space (`{host}/{slug}`), so the project
+   * menu can open it. `cfg.spaceId` holds the project UUID (or, if the user pasted
+   * it, the slug), but the web app addresses spaces by slug — task URLs are
+   * `{origin}/{slug}/item/{id}` — so resolve the canonical slug via `/me`. Returns
+   * null when offline, the token is invalid, or the space is no longer accessible.
+   */
+  getSpaceUrl$(cfg: PlainspaceCfg): Observable<string | null> {
+    if (!cfg.host || !cfg.spaceId) {
+      return of(null);
+    }
+    return this.getMe$(cfg).pipe(
+      map((me) => {
+        // Guard the body shape defensively: a 200 with a malformed payload
+        // (non-array `projects`) is NOT caught by getMe$'s HTTP catchError and
+        // would otherwise throw here — becoming an unhandled rejection with no
+        // OPEN_FAILED snack. Mirrors the Array.isArray guard in getMyTasks$.
+        const projects = me && Array.isArray(me.projects) ? me.projects : [];
+        const space = projects.find(
+          (p) => p.id === cfg.spaceId || p.slug === cfg.spaceId,
+        );
+        // Require a non-empty slug: `space` with a blank slug would build the
+        // host root ({host}/) — send OPEN_FAILED instead of the wrong page.
+        return space?.slug ? `${cfg.host}/${space.slug}` : null;
+      }),
+    );
+  }
+
   /** Tasks assigned to me in this provider's space — imported as SP tasks. */
   getMyTasks$(cfg: PlainspaceCfg): Observable<PlainspaceIssue[]> {
     return this._http
@@ -129,6 +157,24 @@ export class PlainspaceApiService {
         map((res) => mapSPTaskToIssue(res.task)),
         catchError(() => of(null)),
       );
+  }
+
+  /**
+   * Creates a new task in the bound space (`cfg.spaceId`) and returns it mapped
+   * to a `PlainspaceIssue`. The symmetric twin of `claimTask$`: it lets a task
+   * added to a Plainspace-backed project appear for the team. Used by the
+   * two-way-sync adapter's `createIssue`. Errors propagate (unlike the reads and
+   * like `createSpace$`) so the auto-create effect can surface a failure snack
+   * instead of silently dropping the task.
+   */
+  createTask$(title: string, cfg: PlainspaceCfg): Observable<PlainspaceIssue> {
+    return this._http
+      .post<SPTaskResponse>(
+        `${this._base(cfg)}/tasks`,
+        { spaceId: cfg.spaceId, title },
+        { headers: this._headers(cfg) },
+      )
+      .pipe(map((res) => mapSPTaskToIssue(res.task)));
   }
 
   /** Creates a remote space and returns its id (used by the share flow). */

@@ -208,7 +208,10 @@ export const selectActiveWorkContext = createSelector(
       }
       return {
         ...project,
-        icon: null,
+        // Keep the project's own icon so consumers (e.g. the header title icon)
+        // match the side nav; fall back to null when unset. `...project` already
+        // carries `icon`, but stay explicit since this used to force null.
+        icon: project.icon ?? null,
         taskIds: project.taskIds || [],
         isEnableBacklog: project.isEnableBacklog,
         backlogTaskIds: project.backlogTaskIds || [],
@@ -350,6 +353,23 @@ export const selectUndoneTodayTaskIds = createSelector(
     // selectTodayTaskIds already uses board-style pattern
     return todayTaskIds.filter((taskId) => taskState.entities[taskId]?.isDone === false);
   },
+);
+
+/**
+ * Done vs total count of today's top-level tasks, from a single composed
+ * selector so `done`/`total` are always read from the SAME settled state.
+ * Deriving them from two separate store.select subscriptions (combineLatest)
+ * glitches: a task-add emits the new total with a stale undone count,
+ * transiently inflating `done`. Since `undone ⊆ all`, `done` never goes
+ * negative. Used by the rating-prompt "productive win" signal.
+ */
+export const selectTodayProgress = createSelector(
+  selectTodayTaskIds,
+  selectUndoneTodayTaskIds,
+  (allIds, undoneIds): { done: number; total: number } => ({
+    done: allIds.length - undoneIds.length,
+    total: allIds.length,
+  }),
 );
 
 export const selectTimelineTasks = createSelector(
